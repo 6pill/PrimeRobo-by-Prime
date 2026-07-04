@@ -3,14 +3,24 @@ PrimeRobo AI Interface
 =======================
 A polished, self-contained desktop chat assistant built with Tkinter.
 
-Features
---------
-* Multiple chat sessions (create / rename / delete / clear), persisted to disk.
-* A small local "brain": clock & calendar answers, a word-problem calculator,
-  an online dictionary lookup, an online Wikipedia lookup, and a
-  learn-as-you-go knowledge base for anything else.
-* Network calls run on background threads so the UI never freezes.
-* A dark, rounded-bubble chat theme with a customizable background color.
+Highlights
+----------
+* An extensible "Skills" system (clock, calendar, dictionary, Wikipedia,
+  calculator, help, learn-as-you-go knowledge base) — adding a new
+  capability means adding one small class.
+* Three switchable visual themes plus a custom-background color picker.
+* Multiple, persisted chat sessions with search, rename, clear, and delete.
+* A calculator that understands words, percentages, powers, roots and mod.
+* Multi-line message composer (Enter to send, Shift+Enter for a new line).
+* Smart auto-scroll that never yanks you away from history you're reading,
+  plus a "jump to latest" pill when you're scrolled up.
+* Consecutive messages from the same sender are visually grouped.
+* An animated "thinking…" indicator while a network lookup is in flight
+  (which itself always runs on a background thread, so the UI never
+  freezes).
+* Right-click any message to copy or delete it; right-click any chat to
+  rename, clear, or delete it.
+* Window size and chosen theme are remembered between launches.
 
 Only the Python standard library is required.
 """
@@ -18,13 +28,14 @@ Only the Python standard library is required.
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 import tkinter as tk
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from difflib import get_close_matches
 from pathlib import Path
@@ -38,6 +49,7 @@ from typing import Callable, Optional
 BASE_DIR = Path(__file__).resolve().parent
 KNOWLEDGE_BASE_PATH = BASE_DIR / "knowledge_base.json"
 CHATS_PATH = BASE_DIR / "chats.json"
+SETTINGS_PATH = BASE_DIR / "settings.json"
 
 
 # --------------------------------------------------------------------------- #
@@ -60,13 +72,28 @@ _SCALES = {"hundred": 100, "thousand": 1000, "million": 1_000_000}
 def words_to_number(text: str) -> float:
     """Convert a plain number or an English number phrase to a float.
 
-    Accepts digits ("42", "3.5") as well as words ("two hundred and five").
-    Raises ValueError if a token isn't recognized.
+    Accepts digits ("42", "-3.5") as well as words ("two hundred and five",
+    "negative four"). Raises ValueError if a token isn't recognized.
     """
-    cleaned = text.lower().replace("-", " ").replace(" and ", " ").strip()
+    raw = text.lower().strip()
 
-    if re.match(r"^\d+(?:\.\d+)?$", cleaned):
-        return float(cleaned)
+    # A bare (optionally signed) digit literal — check this first, before
+    # any hyphen normalization, since "-5" is a sign here but a hyphen
+    # inside a word like "twenty-five" is just a separator.
+    if re.match(r"^-?\d+(?:\.\d+)?$", raw):
+        return float(raw)
+
+    negative = False
+    cleaned = raw
+    for prefix in ("negative ", "minus "):
+        if cleaned.startswith(prefix):
+            negative = True
+            cleaned = cleaned[len(prefix):]
+            break
+
+    cleaned = cleaned.replace("-", " ").replace(" and ", " ").strip()
+    if not cleaned:
+        raise ValueError("No number given.")
 
     current = 0
     total = 0
@@ -84,7 +111,8 @@ def words_to_number(text: str) -> float:
         else:
             raise ValueError(f"Unrecognized number word: '{word}'")
 
-    return float(total + current)
+    result = float(total + current)
+    return -result if negative else result
 
 
 # --------------------------------------------------------------------------- #
@@ -97,37 +125,118 @@ def _divide(a: float, b: float) -> float:
     return a / b
 
 
+def _modulo(a: float, b: float) -> float:
+    if b == 0:
+        raise ValueError("Cannot divide by zero.")
+    return a % b
+
+
+def _percent_of(a: float, b: float) -> float:
+    return (a / 100) * b
+
+
+# Order matters: more specific / multi-word phrases are listed first so they
+# win over shorter phrases that might otherwise also appear in the text.
 _OPERATORS: list[tuple[str, str]] = [
-    ("divided by", "/"), ("divide", "/"), ("plus", "+"), ("add", "+"),
-    ("minus", "-"), ("subtract", "-"), ("times", "*"), ("multiply", "*"),
-    ("+", "+"), ("-", "-"), ("*", "*"), ("/", "/"),
+    ("divided by", "/"), ("divide", "/"),
+    ("to the power of", "**"),
+    ("modulo", "%"), ("mod", "%"),
+    ("plus", "+"), ("add", "+"),
+    ("minus", "-"), ("subtract", "-"),
+    ("times", "*"), ("multiply", "*"),
+    ("+", "+"), ("-", "-"), ("*", "*"), ("/", "/"), ("^", "**"), ("%", "%"),
 ]
 _OPS: dict[str, Callable[[float, float], float]] = {
     "+": lambda a, b: a + b,
     "-": lambda a, b: a - b,
     "*": lambda a, b: a * b,
     "/": _divide,
+    "**": lambda a, b: a ** b,
+    "%": _modulo,
 }
+
+_SQRT_RE = re.compile(r"^(?:square root of|sqrt(?: of)?)\s+(.+)$")
+_SQUARE_RE = re.compile(r"^(.+?)\s+squared$")
+_CUBE_RE = re.compile(r"^(.+?)\s+cubed$")
+_PERCENT_RE = re.compile(r"^(.+?)\s*(?:percent|%)\s*of\s+(.+)$")
+
+
+def _find_operator(lowered: str) -> Optional[tuple[str, re.Match]]:
+    """Find the first (by priority list, not position) operator keyword or
+    symbol present in `lowered`, matched on a word boundary for alphabetic
+    keywords so we don't trigger on substrings like 'address' or 'modem'.
+    """
+    for keyword, symbol in _OPERATORS:
+        if keyword.replace(" ", "").isalpha():
+            pattern = r"\b" + re.escape(keyword) + r"\b"
+        else:
+            pattern = re.escape(keyword)
+        match = re.search(pattern, lowered)
+        if match:
+            return symbol, match
+    return None
+
+
+def _safe_number(text: str) -> Optional[float]:
+    """words_to_number that returns None instead of raising, for use where
+    a parse failure should mean 'this wasn't really math' rather than a
+    user-facing error.
+    """
+    try:
+        return words_to_number(text)
+    except ValueError:
+        return None
 
 
 def parse_and_calculate(text: str) -> Optional[float]:
-    """Try to parse `text` as a two-operand word/number expression and
-    evaluate it. Returns None if no operator keyword is present at all
-    (meaning: this probably isn't a math question). Raises ValueError for
-    a recognized-but-invalid expression (e.g. division by zero, garbage
-    operands), so the caller can show a helpful error instead of silently
-    ignoring it.
+    """Try to interpret `text` as a math expression and evaluate it.
+
+    Returns None if the text doesn't look like math at all (so the caller
+    can fall through to something else, like the knowledge base). Raises
+    ValueError only for expressions that clearly *are* math but are
+    mathematically invalid (division by zero, a negative square root) —
+    those deserve a visible error rather than silent fallback.
     """
-    lowered = text.lower()
-    for keyword, symbol in _OPERATORS:
-        if keyword in lowered:
-            left, right = lowered.split(keyword, 1)
-            left, right = left.strip(), right.strip()
-            if not left or not right:
-                continue
-            num1 = words_to_number(left)
-            num2 = words_to_number(right)
-            return _OPS[symbol](num1, num2)
+    lowered = text.lower().strip()
+
+    m = _SQRT_RE.match(lowered)
+    if m:
+        value = _safe_number(m.group(1).strip())
+        if value is None:
+            return None
+        if value < 0:
+            raise ValueError("Can't take the square root of a negative number.")
+        return math.sqrt(value)
+
+    m = _SQUARE_RE.match(lowered)
+    if m:
+        value = _safe_number(m.group(1).strip())
+        return None if value is None else value ** 2
+
+    m = _CUBE_RE.match(lowered)
+    if m:
+        value = _safe_number(m.group(1).strip())
+        return None if value is None else value ** 3
+
+    m = _PERCENT_RE.match(lowered)
+    if m:
+        a = _safe_number(m.group(1).strip())
+        b = _safe_number(m.group(2).strip())
+        return None if a is None or b is None else _percent_of(a, b)
+
+    found = _find_operator(lowered)
+    if found:
+        symbol, match = found
+        left = lowered[:match.start()].strip()
+        right = lowered[match.end():].strip()
+        if not left or not right:
+            return None
+        num1 = _safe_number(left)
+        num2 = _safe_number(right)
+        if num1 is None or num2 is None:
+            return None
+        return _OPS[symbol](num1, num2)  # may raise ValueError (e.g. /0)
+
     return None
 
 
@@ -173,14 +282,14 @@ class KnowledgeBase:
 # --------------------------------------------------------------------------- #
 
 class NetworkService:
-    """Wraps the dictionary/Wikipedia HTTP lookups and runs them on a
-    background thread, delivering the result back on the Tk main thread.
+    """Runs the dictionary/Wikipedia HTTP lookups on a background thread and
+    delivers the result back on the Tk main thread via `root.after`.
     """
 
     def __init__(self, root: tk.Tk):
         self._root = root
 
-    def run(self, worker: Callable[[], str], on_done: Callable[[str], None]) -> None:
+    def run(self, worker: Callable[[], Optional[str]], on_done: Callable[[Optional[str]], None]) -> None:
         def _target():
             try:
                 result = worker()
@@ -198,7 +307,7 @@ class NetworkService:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=5) as response:
                 data = json.loads(response.read().decode())
-        except (urllib.error.URLError, TimeoutError, ValueError):
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError):
             return None
 
         if not data or not isinstance(data, list):
@@ -224,7 +333,7 @@ class NetworkService:
             )
             with urllib.request.urlopen(req, timeout=5) as response:
                 data = json.loads(response.read().decode())
-        except (urllib.error.URLError, TimeoutError, ValueError):
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError):
             return None
 
         extract = data.get("extract")
@@ -276,10 +385,10 @@ class ChatStore:
         chats = raw.get("chats", {})
         if not chats:
             return False
-        self.chats = {
-            name: [Message(**m) for m in messages] for name, messages in chats.items()
-        }
-        self.order = raw.get("order", list(self.chats.keys()))
+        self.chats = {name: [Message(**m) for m in msgs] for name, msgs in chats.items()}
+        self.order = [n for n in raw.get("order", list(self.chats.keys())) if n in self.chats]
+        if not self.order:
+            self.order = list(self.chats.keys())
         return True
 
     def save(self) -> None:
@@ -314,40 +423,101 @@ class ChatStore:
         self.chats[name].append(message)
         self.save()
 
-    def replace_last(self, name: str, message: Message) -> None:
-        self.chats[name][-1] = message
+    def delete_message(self, name: str, index: int) -> None:
+        messages = self.chats.get(name)
+        if not messages or not (0 <= index < len(messages)):
+            return
+        del messages[index]
+        if not messages:
+            messages.append(Message("PrimeRobo", "…", False))
         self.save()
+
+
+# --------------------------------------------------------------------------- #
+# Settings persistence (window geometry + theme choice)
+# --------------------------------------------------------------------------- #
+
+class Settings:
+    def __init__(self, path: Path = SETTINGS_PATH):
+        self.path = path
+        data = self._load()
+        self.geometry: str = data.get("geometry", "960x640")
+        self.palette_name: str = data.get("palette", "Midnight")
+        self.custom_bg: Optional[str] = data.get("custom_bg")
+
+    def _load(self) -> dict:
+        if not self.path.exists():
+            return {}
+        try:
+            return json.loads(self.path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def save(self) -> None:
+        payload = {
+            "geometry": self.geometry,
+            "palette": self.palette_name,
+            "custom_bg": self.custom_bg,
+        }
+        try:
+            self.path.write_text(json.dumps(payload, indent=2))
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------- #
 # Visual theme
 # --------------------------------------------------------------------------- #
 
-class Theme:
-    SIDEBAR = "#1a1f29"
-    SIDEBAR_ITEM = "#252c3b"
-    ACCENT = "#ff9f43"
-    ACCENT_HOVER = "#ffb56b"
-    BUBBLE_USER = "#3457d5"
-    BUBBLE_BOT = "#232b3a"
-    TEXT_ON_ACCENT = "#161616"
-    TEXT_PRIMARY = "#ffffff"
-    TEXT_BOT = "#e7ecf5"
-    TEXT_MUTED = "#8b96ab"
-    DANGER = "#ff5d5d"
-    DANGER_HOVER = "#ff7d7d"
-    SUCCESS = "#37d67a"
-    BORDER = "#3d495e"
+@dataclass(frozen=True)
+class Palette:
+    name: str
+    bg: str
+    sidebar: str
+    sidebar_item: str
+    accent: str
+    accent_hover: str
+    bubble_user: str
+    bubble_bot: str
+    text_on_accent: str
+    text_primary: str
+    text_bot: str
+    text_muted: str
+    danger: str
+    danger_hover: str
+    border: str
 
-    FAMILY = "Segoe UI"
-    SIZE_TITLE = 11
-    SIZE_BODY = 11
-    SIZE_SMALL = 9
-    SIZE_TINY = 8
 
-    @classmethod
-    def font(cls, size=None, weight="normal") -> tuple:
-        return (cls.FAMILY, size or cls.SIZE_BODY, weight)
+PALETTES: dict[str, Palette] = {
+    "Midnight": Palette(
+        name="Midnight", bg="#11141a", sidebar="#1a1f29", sidebar_item="#252c3b",
+        accent="#ff9f43", accent_hover="#ffb56b", bubble_user="#3457d5", bubble_bot="#232b3a",
+        text_on_accent="#161616", text_primary="#ffffff", text_bot="#e7ecf5",
+        text_muted="#8b96ab", danger="#ff5d5d", danger_hover="#ff7d7d", border="#3d495e",
+    ),
+    "Aurora": Palette(
+        name="Aurora", bg="#0f1720", sidebar="#141d2b", sidebar_item="#1d2a3d",
+        accent="#5eead4", accent_hover="#8ff3e3", bubble_user="#7c5cff", bubble_bot="#1c2739",
+        text_on_accent="#0a1620", text_primary="#f2f5f9", text_bot="#dbe6f5",
+        text_muted="#7c8ba3", danger="#ff6b81", danger_hover="#ff8a9c", border="#2c3c52",
+    ),
+    "Daylight": Palette(
+        name="Daylight", bg="#f4f6fb", sidebar="#e9edf7", sidebar_item="#dde3f2",
+        accent="#3457d5", accent_hover="#5674e0", bubble_user="#3457d5", bubble_bot="#ffffff",
+        text_on_accent="#ffffff", text_primary="#1b2233", text_bot="#1b2233",
+        text_muted="#6b7385", danger="#e5484d", danger_hover="#f16d71", border="#c7cee2",
+    ),
+}
+
+FONT_FAMILY = "Segoe UI"
+SIZE_TITLE = 13
+SIZE_BODY = 11
+SIZE_SMALL = 9
+SIZE_TINY = 8
+
+
+def font(size: int = SIZE_BODY, weight: str = "normal") -> tuple:
+    return (FONT_FAMILY, size, weight)
 
 
 def rounded_rect(canvas: tk.Canvas, x1, y1, x2, y2, radius, **kwargs):
@@ -370,6 +540,124 @@ def rounded_rect(canvas: tk.Canvas, x1, y1, x2, y2, radius, **kwargs):
 
 
 # --------------------------------------------------------------------------- #
+# Skills — each capability is a small, self-contained, easy-to-extend class
+# --------------------------------------------------------------------------- #
+
+class Skill:
+    """Base class for a single conversational capability.
+
+    `try_handle` should return True if it fully handled the message
+    (including by showing a helpful error), or False to let the next
+    skill in line have a turn.
+    """
+
+    description: str = ""
+
+    def try_handle(self, app: "PrimeRoboApp", text: str, lowered: str) -> bool:
+        raise NotImplementedError
+
+
+class HelpSkill(Skill):
+    description = "Ask 'help' any time to see everything I can do."
+    _QUERIES = {"help", "/help", "commands", "what can you do", "what can you do?"}
+
+    def try_handle(self, app, text, lowered):
+        if lowered not in self._QUERIES:
+            return False
+        lines = ["Here's what I can help with:", ""]
+        for skill in app.skills:
+            if isinstance(skill, HelpSkill) or not skill.description:
+                continue
+            lines.append(f"• {skill.description}")
+        lines.append("• Type 'quit' to exit.")
+        app.reply("\n".join(lines))
+        return True
+
+
+class ClockSkill(Skill):
+    description = "Ask 'what time is it' for the current time."
+    _QUERIES = {"what is the time", "what is time", "time", "current time", "what time is it"}
+
+    def try_handle(self, app, text, lowered):
+        if lowered not in self._QUERIES:
+            return False
+        app.reply(f"Current time: {datetime.now().strftime('%I:%M %p')}")
+        return True
+
+
+class CalendarSkill(Skill):
+    description = "Ask 'what is the date' or 'today' for today's date."
+    _QUERIES = {
+        "what is the date", "what is date", "date", "today's date",
+        "what is today", "today", "day",
+    }
+
+    def try_handle(self, app, text, lowered):
+        if lowered not in self._QUERIES:
+            return False
+        app.reply(f"Today is {datetime.now().strftime('%A, %B %d, %Y')}")
+        return True
+
+
+class DefineSkill(Skill):
+    description = "Ask 'define <word>' for an online dictionary lookup."
+    _PATTERN = re.compile(r"^(?:define|meaning of|what is the meaning of)\s+([a-zA-Z0-9\s\-_]+)$")
+
+    def try_handle(self, app, text, lowered):
+        m = self._PATTERN.match(lowered)
+        if not m:
+            return False
+        app.lookup_definition(m.group(1).strip())
+        return True
+
+
+class WikipediaSkill(Skill):
+    description = "Ask 'who is <name>' or 'tell me about <topic>' for a Wikipedia summary."
+    _PATTERN = re.compile(r"^(?:who is|who was|tell me about|search up)\s+([a-zA-Z0-9\s\-_]+)$")
+
+    def try_handle(self, app, text, lowered):
+        m = self._PATTERN.match(lowered)
+        if not m:
+            return False
+        app.lookup_wikipedia(m.group(1).strip())
+        return True
+
+
+class MathSkill(Skill):
+    description = "Ask things like '12 plus 8', '20 percent of 50', 'sqrt of 81', or '5 squared'."
+
+    def try_handle(self, app, text, lowered):
+        try:
+            result = parse_and_calculate(text)
+        except ValueError as exc:
+            app.reply(f"⚠️ {exc}")
+            return True
+        if result is None:
+            return False
+        app.reply(f"Result: {result:g}")
+        return True
+
+
+class KnowledgeBaseSkill(Skill):
+    """Terminal fallback: always handles the message, one way or another."""
+
+    description = "Ask me anything else — I'll try to remember it, or ask you to teach me."
+
+    def try_handle(self, app, text, lowered):
+        answer = app.knowledge_base.find_answer(text)
+        if answer:
+            app.reply(answer)
+        else:
+            app.reply(
+                "I don't know that one yet. Reply with the answer to teach me, "
+                "or type 'skip' to move on."
+            )
+            app.teaching_mode = True
+            app.pending_question = text
+        return True
+
+
+# --------------------------------------------------------------------------- #
 # Main application
 # --------------------------------------------------------------------------- #
 
@@ -377,29 +665,43 @@ class PrimeRoboApp:
     BUBBLE_PAD_X = 16
     BUBBLE_PAD_Y = 12
     MIN_WRAP = 220
+    MAX_INPUT_LINES = 5
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("PrimeRobo AI Interface")
-        self.root.geometry("900x620")
-        self.root.minsize(560, 480)
+        self.settings = Settings()
 
-        self.bg = "#11141a"
-        self.root.configure(bg=self.bg)
+        base_palette = PALETTES.get(self.settings.palette_name, PALETTES["Midnight"])
+        self.palette = replace(base_palette, bg=self.settings.custom_bg) if self.settings.custom_bg else base_palette
+
+        self.root.title("PrimeRobo AI Interface")
+        self.root.geometry(self.settings.geometry)
+        self.root.minsize(560, 480)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.knowledge_base = KnowledgeBase()
         self.chat_store = ChatStore()
         self.network = NetworkService(root)
+        self.skills: list[Skill] = [
+            HelpSkill(), ClockSkill(), CalendarSkill(), DefineSkill(),
+            WikipediaSkill(), MathSkill(), KnowledgeBaseSkill(),
+        ]
 
         self.current_chat = self.chat_store.order[0]
         self.chat_counter = len(self.chat_store.order)
         self.teaching_mode = False
         self.pending_question = ""
         self._resize_job: Optional[str] = None
+        self._near_bottom = True
+        self._thinking_job: Optional[str] = None
+        self._thinking_base_text = ""
+        self._thinking_chat = ""
+        self._thinking_frame = 0
+        self._flash_active = False
+        self._search_placeholder = "🔍  Search chats…"
 
         self._build_layout()
-        self._refresh_sidebar()
-        self._render_chat()
+        self._apply_theme()
         self.entry.focus_set()
 
     # ----------------------------- layout ------------------------------- #
@@ -411,62 +713,59 @@ class PrimeRoboApp:
         self._build_sidebar()
         self._build_main_panel()
 
-        self.context_menu = tk.Menu(
-            self.root, tearoff=0, bg=Theme.SIDEBAR_ITEM, fg=Theme.TEXT_PRIMARY,
-            activebackground=Theme.ACCENT, activeforeground=Theme.TEXT_ON_ACCENT,
-            bd=0,
-        )
+        self.context_menu = tk.Menu(self.root, tearoff=0, bd=0)
+        self.root.bind("<Control-n>", lambda e: self.create_chat())
 
     def _build_sidebar(self) -> None:
-        self.sidebar = tk.Frame(self.root, bg=Theme.SIDEBAR, width=240)
+        self.sidebar = tk.Frame(self.root, width=240)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         self.sidebar.grid_propagate(False)
 
-        header = tk.Frame(self.sidebar, bg=Theme.SIDEBAR)
-        header.pack(fill=tk.X, pady=15, padx=12)
-        tk.Label(
-            header, text="🤖 CHAT LOGS", fg=Theme.ACCENT, bg=Theme.SIDEBAR,
-            font=Theme.font(10, "bold"),
-        ).pack(side=tk.LEFT)
-        self._pill_button(
-            header, "+ NEW", self.create_chat, side=tk.RIGHT,
-        )
+        self.sidebar_header = tk.Frame(self.sidebar)
+        self.sidebar_header.pack(fill=tk.X, pady=(15, 8), padx=12)
+        self.sidebar_title_label = tk.Label(self.sidebar_header, text="🤖 CHAT LOGS", font=font(10, "bold"))
+        self.sidebar_title_label.pack(side=tk.LEFT)
+        self.new_chat_btn = self._pill_button(self.sidebar_header, "+ NEW", self.create_chat, side=tk.RIGHT)
 
-        self.chat_list = tk.Frame(self.sidebar, bg=Theme.SIDEBAR)
+        self.search_frame = tk.Frame(self.sidebar)
+        self.search_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
+        self.search_entry = tk.Entry(self.search_frame, font=font(SIZE_SMALL), bd=0,
+                                      highlightthickness=1)
+        self.search_entry.pack(fill=tk.X, ipady=4)
+        self.search_entry.bind("<FocusIn>", self._on_search_focus_in)
+        self.search_entry.bind("<FocusOut>", self._on_search_focus_out)
+        self.search_entry.bind("<KeyRelease>", lambda e: self._refresh_sidebar())
+
+        self.chat_list = tk.Frame(self.sidebar)
         self.chat_list.pack(fill=tk.BOTH, expand=True)
 
-        footer = tk.Frame(self.sidebar, bg=Theme.SIDEBAR, pady=10, padx=12)
-        footer.pack(fill=tk.X, side=tk.BOTTOM)
-        self._pill_button(
-            footer, "🎨  Custom Background", self.pick_background_color, fill=tk.X,
+        self.sidebar_footer = tk.Frame(self.sidebar, pady=10, padx=12)
+        self.sidebar_footer.pack(fill=tk.X, side=tk.BOTTOM)
+        self.appearance_btn = self._pill_button(
+            self.sidebar_footer, "🎨  Appearance", self.open_appearance_panel, fill=tk.X,
         )
 
     def _build_main_panel(self) -> None:
-        self.main = tk.Frame(self.root, bg=self.bg)
+        self.main = tk.Frame(self.root)
         self.main.grid(row=0, column=1, sticky="nsew", padx=12, pady=12)
         self.main.grid_columnconfigure(0, weight=1)
         self.main.grid_rowconfigure(1, weight=1)
 
-        self.header_bar = tk.Frame(self.main, bg=self.bg)
+        self.header_bar = tk.Frame(self.main)
         self.header_bar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        self.title_label = tk.Label(
-            self.header_bar, text=self.current_chat, fg=Theme.TEXT_PRIMARY, bg=self.bg,
-            font=Theme.font(13, "bold"), anchor="w",
-        )
+        self.title_label = tk.Label(self.header_bar, text=self.current_chat, font=font(SIZE_TITLE, "bold"), anchor="w")
         self.title_label.pack(side=tk.LEFT)
-        self.status_label = tk.Label(
-            self.header_bar, text="", fg=Theme.TEXT_MUTED, bg=self.bg, font=Theme.font(Theme.SIZE_SMALL),
-        )
+        self.status_label = tk.Label(self.header_bar, text="", font=font(SIZE_SMALL))
         self.status_label.pack(side=tk.RIGHT)
 
-        body = tk.Frame(self.main, bg=self.bg)
-        body.grid(row=1, column=0, sticky="nsew")
-        body.grid_columnconfigure(0, weight=1)
-        body.grid_rowconfigure(0, weight=1)
+        self.body = tk.Frame(self.main)
+        self.body.grid(row=1, column=0, sticky="nsew")
+        self.body.grid_columnconfigure(0, weight=1)
+        self.body.grid_rowconfigure(0, weight=1)
 
-        self.canvas = tk.Canvas(body, bg=self.bg, bd=0, highlightthickness=0)
-        self.scrollbar = ttk.Scrollbar(body, orient="vertical", command=self.canvas.yview)
-        self.scroll_frame = tk.Frame(self.canvas, bg=self.bg)
+        self.canvas = tk.Canvas(self.body, bd=0, highlightthickness=0)
+        self.scrollbar = ttk.Scrollbar(self.body, orient="vertical", command=self._on_scrollbar_move)
+        self.scroll_frame = tk.Frame(self.canvas)
 
         self.scroll_frame.bind(
             "<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -478,37 +777,36 @@ class PrimeRoboApp:
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.scrollbar.grid(row=0, column=1, sticky="ns")
 
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)   # Windows/macOS
-        self.canvas.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-2, "units"))  # Linux
-        self.canvas.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(2, "units"))
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-4>", lambda e: self._scroll_units(-2))
+        self.canvas.bind_all("<Button-5>", lambda e: self._scroll_units(2))
 
-        input_bar = tk.Frame(self.main, bg=self.bg)
+        self.jump_pill = tk.Button(
+            self.body, text="↓  Jump to latest", font=font(SIZE_SMALL, "bold"),
+            relief=tk.FLAT, bd=0, padx=12, pady=6, cursor="hand2", command=self._jump_to_bottom,
+        )
+
+        input_bar = tk.Frame(self.main)
+        self.input_bar = input_bar
         input_bar.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         input_bar.grid_columnconfigure(0, weight=1)
 
-        self.entry = tk.Entry(
-            input_bar, font=Theme.font(Theme.SIZE_BODY), bg="#1e2530", fg=Theme.TEXT_PRIMARY,
-            insertbackground="white", bd=0, highlightthickness=1,
-            highlightbackground=Theme.BORDER, highlightcolor=Theme.ACCENT,
-        )
-        self.entry.grid(row=0, column=0, sticky="ew", ipady=9, padx=(0, 8))
-        self.entry.bind("<Return>", self.handle_send)
+        self.entry = tk.Text(input_bar, font=font(SIZE_BODY), bd=0, height=1, wrap="word",
+                              highlightthickness=1)
+        self.entry.grid(row=0, column=0, sticky="ew", padx=(0, 8), ipady=6)
+        self.entry.bind("<Return>", self._on_return)
+        self.entry.bind("<KeyRelease>", self._autogrow_input)
         self.entry.bind("<Escape>", self._cancel_teaching)
 
         self.send_button = tk.Button(
-            input_bar, text="TRANSMIT", font=Theme.font(Theme.SIZE_SMALL, "bold"),
-            bg=Theme.ACCENT, fg=Theme.TEXT_ON_ACCENT, activebackground=Theme.ACCENT_HOVER,
+            input_bar, text="TRANSMIT", font=font(SIZE_SMALL, "bold"),
             command=self.handle_send, relief=tk.FLAT, bd=0, padx=16, pady=8, cursor="hand2",
         )
         self.send_button.grid(row=0, column=1, sticky="e")
 
-        self.root.bind("<Control-n>", lambda e: self.create_chat())
-
-    def _pill_button(self, parent, text, command, side=None, fill=None):
+    def _pill_button(self, parent, text, command, side=None, fill=None) -> tk.Button:
         btn = tk.Button(
-            parent, text=text, font=Theme.font(Theme.SIZE_SMALL, "bold"),
-            bg=Theme.SIDEBAR_ITEM, fg=Theme.ACCENT, activebackground=Theme.ACCENT,
-            activeforeground=Theme.TEXT_ON_ACCENT, relief=tk.FLAT, bd=0,
+            parent, text=text, font=font(SIZE_SMALL, "bold"), relief=tk.FLAT, bd=0,
             padx=10, pady=6, cursor="hand2", command=command,
         )
         if fill:
@@ -517,48 +815,141 @@ class PrimeRoboApp:
             btn.pack(side=side or tk.LEFT)
         return btn
 
-    # --------------------------- sidebar logic --------------------------- #
+    # ------------------------------ theming ------------------------------- #
+
+    def _apply_theme(self) -> None:
+        p = self.palette
+        self.root.configure(bg=p.bg)
+
+        self.sidebar.configure(bg=p.sidebar)
+        self.sidebar_header.configure(bg=p.sidebar)
+        self.sidebar_title_label.configure(bg=p.sidebar, fg=p.accent)
+        self.new_chat_btn.configure(bg=p.sidebar_item, fg=p.accent,
+                                     activebackground=p.accent, activeforeground=p.text_on_accent)
+
+        self.search_frame.configure(bg=p.sidebar)
+        self.search_entry.configure(
+            bg=p.sidebar_item, insertbackground=p.text_primary,
+            highlightbackground=p.border, highlightcolor=p.accent,
+        )
+        self._restyle_search_entry()
+
+        self.chat_list.configure(bg=p.sidebar)
+        self.sidebar_footer.configure(bg=p.sidebar)
+        self.appearance_btn.configure(bg=p.sidebar_item, fg=p.accent,
+                                       activebackground=p.accent, activeforeground=p.text_on_accent)
+
+        self.main.configure(bg=p.bg)
+        self.header_bar.configure(bg=p.bg)
+        self.title_label.configure(bg=p.bg, fg=p.text_primary)
+        self.status_label.configure(bg=p.bg, fg=p.text_muted)
+
+        self.body.configure(bg=p.bg)
+        self.canvas.configure(bg=p.bg)
+        self.scroll_frame.configure(bg=p.bg)
+        self.jump_pill.configure(bg=p.accent, fg=p.text_on_accent, activebackground=p.accent_hover)
+
+        self.input_bar.configure(bg=p.bg)
+        self.entry.configure(
+            bg=p.sidebar_item, fg=p.text_primary, insertbackground=p.text_primary,
+            highlightbackground=p.border, highlightcolor=p.accent,
+        )
+        self.send_button.configure(bg=p.accent, fg=p.text_on_accent, activebackground=p.accent_hover)
+
+        self.context_menu.configure(bg=p.sidebar_item, fg=p.text_primary,
+                                     activebackground=p.accent, activeforeground=p.text_on_accent)
+
+        self._refresh_sidebar()
+        self._render_chat()
+
+    def _restyle_search_entry(self) -> None:
+        p = self.palette
+        current = self.search_entry.get()
+        if current == self._search_placeholder or not current.strip():
+            self.search_entry.configure(fg=p.text_muted)
+        else:
+            self.search_entry.configure(fg=p.text_primary)
+
+    # --------------------------- sidebar / search -------------------------- #
+
+    def _on_search_focus_in(self, _e=None) -> None:
+        if self.search_entry.get() == self._search_placeholder:
+            self.search_entry.delete(0, tk.END)
+        self.search_entry.configure(fg=self.palette.text_primary)
+
+    def _on_search_focus_out(self, _e=None) -> None:
+        if not self.search_entry.get().strip():
+            self._set_search_placeholder()
+
+    def _set_search_placeholder(self) -> None:
+        self.search_entry.delete(0, tk.END)
+        self.search_entry.insert(0, self._search_placeholder)
+        self.search_entry.configure(fg=self.palette.text_muted)
+
+    def _current_search_query(self) -> str:
+        text = self.search_entry.get().strip()
+        if text == self._search_placeholder:
+            return ""
+        return text.lower()
 
     def _refresh_sidebar(self) -> None:
+        p = self.palette
         for widget in self.chat_list.winfo_children():
             widget.destroy()
 
-        for name in self.chat_store.order:
-            row = tk.Frame(self.chat_list, bg=Theme.SIDEBAR)
+        # Ensure the placeholder is showing when appropriate (e.g. right
+        # after a theme switch tears down and rebuilds nothing here, but
+        # focus state may have changed).
+        if not self.search_entry.get().strip() and self.search_entry.focus_get() != self.search_entry:
+            self._set_search_placeholder()
+
+        query = self._current_search_query()
+        names = [n for n in self.chat_store.order if query in n.lower()] if query else list(self.chat_store.order)
+
+        if not names:
+            tk.Label(self.chat_list, text="No matching chats", fg=p.text_muted, bg=p.sidebar,
+                      font=font(SIZE_SMALL)).pack(pady=20)
+            return
+
+        for name in names:
+            row = tk.Frame(self.chat_list, bg=p.sidebar)
             row.pack(fill=tk.X, padx=10, pady=3)
 
             active = name == self.current_chat
             btn = tk.Button(
-                row, text=name, font=Theme.font(Theme.SIZE_SMALL, "bold" if active else "normal"),
-                bg=Theme.ACCENT if active else Theme.SIDEBAR_ITEM,
-                fg=Theme.TEXT_ON_ACCENT if active else Theme.TEXT_PRIMARY,
+                row, text=name, font=font(SIZE_SMALL, "bold" if active else "normal"),
+                bg=p.accent if active else p.sidebar_item,
+                fg=p.text_on_accent if active else p.text_primary,
                 relief=tk.FLAT, bd=0, pady=8, anchor="w", padx=10, cursor="hand2",
                 command=lambda n=name: self.switch_chat(n),
             )
             btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            btn.bind("<Button-3>", lambda e, n=name: self._show_context_menu(e, n))
-            btn.bind("<Button-2>", lambda e, n=name: self._show_context_menu(e, n))
+            btn.bind("<Double-Button-1>", lambda e, n=name: self.rename_chat(n))
+            btn.bind("<Button-3>", lambda e, n=name: self._show_chat_menu(e, n))
+            btn.bind("<Button-2>", lambda e, n=name: self._show_chat_menu(e, n))
 
             delete_btn = tk.Button(
-                row, text="🗑", font=Theme.font(Theme.SIZE_SMALL), bg=Theme.DANGER, fg="white",
-                activebackground=Theme.DANGER_HOVER, relief=tk.FLAT, bd=0, padx=8, pady=8,
+                row, text="🗑", font=font(SIZE_SMALL), bg=p.danger, fg="white",
+                activebackground=p.danger_hover, relief=tk.FLAT, bd=0, padx=8, pady=8,
                 cursor="hand2", command=lambda n=name: self.delete_chat(n),
             )
             delete_btn.pack(side=tk.RIGHT, padx=(4, 0))
 
-    def _show_context_menu(self, event, chat_name: str) -> None:
-        self.context_menu.delete(0, tk.END)
-        self.context_menu.add_command(label="📝 Rename", command=lambda: self.rename_chat(chat_name))
-        self.context_menu.add_command(label="🧹 Clear messages", command=lambda: self.clear_chat(chat_name))
-        self.context_menu.add_separator()
-        self.context_menu.add_command(label="🗑 Delete", command=lambda: self.delete_chat(chat_name))
-        self.context_menu.tk_popup(event.x_root, event.y_root)
+    def _show_chat_menu(self, event, chat_name: str) -> None:
+        menu = self.context_menu
+        menu.delete(0, tk.END)
+        menu.add_command(label="📝 Rename", command=lambda: self.rename_chat(chat_name))
+        menu.add_command(label="🧹 Clear messages", command=lambda: self.clear_chat(chat_name))
+        menu.add_separator()
+        menu.add_command(label="🗑 Delete", command=lambda: self.delete_chat(chat_name))
+        menu.tk_popup(event.x_root, event.y_root)
 
     def create_chat(self) -> None:
         self.chat_counter += 1
         name = f"Chat Session {self.chat_counter}"
         self.chat_store.add_chat(name, f"New session online: {name}.")
         self.current_chat = name
+        self._near_bottom = True
         self._refresh_sidebar()
         self._render_chat()
         self.entry.focus_set()
@@ -570,6 +961,7 @@ class PrimeRoboApp:
         self.chat_store.delete_chat(name)
         if self.current_chat == name:
             self.current_chat = self.chat_store.order[0]
+            self._near_bottom = True
         self._refresh_sidebar()
         self._render_chat()
 
@@ -591,24 +983,77 @@ class PrimeRoboApp:
     def clear_chat(self, name: str) -> None:
         self.chat_store.clear_chat(name)
         if self.current_chat == name:
+            self._near_bottom = True
             self._render_chat()
 
     def switch_chat(self, name: str) -> None:
         self.current_chat = name
+        self._near_bottom = True
         self._refresh_sidebar()
         self._render_chat()
         self.entry.focus_set()
 
-    def pick_background_color(self) -> None:
-        result = colorchooser.askcolor(title="Choose background color", initialcolor=self.bg)
+    # --------------------------- appearance panel -------------------------- #
+
+    def open_appearance_panel(self) -> None:
+        p = self.palette
+        win = tk.Toplevel(self.root)
+        win.title("Appearance")
+        win.configure(bg=p.sidebar)
+        win.resizable(False, False)
+        win.transient(self.root)
+
+        tk.Label(win, text="Choose a theme", bg=p.sidebar, fg=p.text_primary,
+                 font=font(SIZE_BODY, "bold")).pack(padx=18, pady=(18, 8), anchor="w")
+
+        for name, palette in PALETTES.items():
+            row = tk.Frame(win, bg=p.sidebar)
+            row.pack(fill=tk.X, padx=18, pady=4)
+
+            swatch = tk.Canvas(row, width=22, height=22, bg=p.sidebar, highlightthickness=0)
+            swatch.create_oval(2, 2, 20, 20, fill=palette.accent, outline=palette.bg)
+            swatch.pack(side=tk.LEFT, padx=(0, 10))
+
+            is_active = palette.name == self.palette.name
+            btn = tk.Button(
+                row, text=name + ("  ✓" if is_active else ""),
+                font=font(SIZE_SMALL, "bold"),
+                bg=p.accent if is_active else p.sidebar_item,
+                fg=p.text_on_accent if is_active else p.text_primary,
+                relief=tk.FLAT, bd=0, anchor="w", padx=10, pady=8, cursor="hand2",
+                command=lambda pal=palette, w=win: self._select_palette(pal, w),
+            )
+            btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        tk.Frame(win, bg=p.border, height=1).pack(fill=tk.X, padx=18, pady=12)
+
+        tk.Button(
+            win, text="🎨  Custom Background Color…", font=font(SIZE_SMALL, "bold"),
+            bg=p.sidebar_item, fg=p.accent, relief=tk.FLAT, bd=0,
+            padx=10, pady=8, cursor="hand2",
+            command=lambda w=win: self._pick_custom_bg(w),
+        ).pack(fill=tk.X, padx=18, pady=(0, 18))
+
+    def _select_palette(self, palette: Palette, win: Optional[tk.Toplevel] = None) -> None:
+        self.palette = palette
+        self.settings.palette_name = palette.name
+        self.settings.custom_bg = None
+        self.settings.save()
+        self._apply_theme()
+        if win is not None:
+            win.destroy()
+
+    def _pick_custom_bg(self, win: Optional[tk.Toplevel] = None) -> None:
+        result = colorchooser.askcolor(title="Choose background color", initialcolor=self.palette.bg,
+                                        parent=win or self.root)
         if not result or not result[1]:
             return
-        self.bg = result[1]
-        for widget in (self.root, self.main, self.canvas, self.scroll_frame, self.header_bar):
-            widget.configure(bg=self.bg)
-        self.title_label.configure(bg=self.bg)
-        self.status_label.configure(bg=self.bg)
-        self._render_chat()
+        self.palette = replace(self.palette, bg=result[1])
+        self.settings.custom_bg = result[1]
+        self.settings.save()
+        self._apply_theme()
+        if win is not None:
+            win.destroy()
 
     # ---------------------------- chat display ---------------------------- #
 
@@ -620,7 +1065,32 @@ class PrimeRoboApp:
 
     def _on_mousewheel(self, event) -> None:
         delta = -1 if event.delta > 0 else 1
-        self.canvas.yview_scroll(delta * 2, "units")
+        self._scroll_units(delta * 2)
+
+    def _scroll_units(self, units: int) -> None:
+        self.canvas.yview_scroll(units, "units")
+        self._update_near_bottom()
+
+    def _on_scrollbar_move(self, *args) -> None:
+        self.canvas.yview(*args)
+        self._update_near_bottom()
+
+    def _update_near_bottom(self) -> None:
+        _, bottom = self.canvas.yview()
+        self._near_bottom = bottom >= 0.98
+        if self._near_bottom:
+            self._hide_jump_pill()
+
+    def _show_jump_pill(self) -> None:
+        self.jump_pill.place(relx=0.5, rely=0.95, anchor="s")
+
+    def _hide_jump_pill(self) -> None:
+        self.jump_pill.place_forget()
+
+    def _jump_to_bottom(self) -> None:
+        self.canvas.yview_moveto(1.0)
+        self._near_bottom = True
+        self._hide_jump_pill()
 
     def _wrap_width(self) -> int:
         available = self.canvas.winfo_width() or 700
@@ -630,44 +1100,61 @@ class PrimeRoboApp:
         for widget in self.scroll_frame.winfo_children():
             widget.destroy()
         self.title_label.configure(text=self.current_chat)
-        for message in self.chat_store.chats[self.current_chat]:
-            self._render_bubble(message)
+
+        messages = self.chat_store.chats[self.current_chat]
+        previous: Optional[Message] = None
+        for index, message in enumerate(messages):
+            grouped = (
+                previous is not None
+                and previous.sender == message.sender
+                and previous.is_user == message.is_user
+            )
+            self._render_bubble(message, index, show_header=not grouped)
+            previous = message
+
         self.root.update_idletasks()
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        self.canvas.yview_moveto(1.0)
+        if self._near_bottom:
+            self.canvas.yview_moveto(1.0)
+            self._hide_jump_pill()
+        else:
+            self._show_jump_pill()
+        self._update_status_count()
 
-    def _render_bubble(self, message: Message) -> None:
+    def _render_bubble(self, message: Message, index: int, show_header: bool) -> None:
+        p = self.palette
         is_user = message.is_user
-        bubble_color = Theme.BUBBLE_USER if is_user else Theme.BUBBLE_BOT
-        text_color = Theme.TEXT_PRIMARY if is_user else Theme.TEXT_BOT
+        bubble_color = p.bubble_user if is_user else p.bubble_bot
+        text_color = "#ffffff" if is_user else p.text_bot
         avatar = "🧑" if is_user else "🤖"
         align_side = tk.RIGHT if is_user else tk.LEFT
         anchor_pos = "ne" if is_user else "nw"
 
-        row = tk.Frame(self.scroll_frame, bg=self.bg, pady=5)
-        row.pack(fill=tk.X, expand=True)
+        row = tk.Frame(self.scroll_frame, bg=p.bg)
+        row.pack(fill=tk.X, expand=True, pady=(6 if show_header else 1, 0))
 
-        wrapper = tk.Frame(row, bg=self.bg)
+        wrapper = tk.Frame(row, bg=p.bg)
         wrapper.pack(side=align_side, anchor=anchor_pos, padx=6)
 
-        header = tk.Frame(wrapper, bg=self.bg)
-        header.pack(fill=tk.X, pady=(0, 3))
-        tk.Label(
-            header, text=f"{avatar} {message.sender}  ·  {message.timestamp}",
-            fg=Theme.TEXT_MUTED, bg=self.bg, font=Theme.font(Theme.SIZE_TINY, "bold"),
-        ).pack(side=align_side)
+        if show_header:
+            header = tk.Frame(wrapper, bg=p.bg)
+            header.pack(fill=tk.X, pady=(0, 3))
+            tk.Label(
+                header, text=f"{avatar} {message.sender}  ·  {message.timestamp}",
+                fg=p.text_muted, bg=p.bg, font=font(SIZE_TINY, "bold"),
+            ).pack(side=align_side)
 
-        content = tk.Frame(wrapper, bg=self.bg)
+        content = tk.Frame(wrapper, bg=p.bg)
         content.pack(fill=tk.X)
 
         bubble = self._make_bubble_canvas(content, message.text, bubble_color, text_color)
         bubble.pack(side=align_side, anchor=anchor_pos)
 
         copy_btn = tk.Button(
-            content, text="📋", font=Theme.font(Theme.SIZE_TINY, "bold"), bg=Theme.SIDEBAR_ITEM,
-            fg=Theme.TEXT_MUTED, activebackground=Theme.ACCENT, activeforeground=Theme.TEXT_ON_ACCENT,
+            content, text="📋", font=font(SIZE_TINY, "bold"), bg=p.sidebar_item,
+            fg=p.text_muted, activebackground=p.accent, activeforeground=p.text_on_accent,
             relief=tk.FLAT, bd=0, padx=6, pady=4, cursor="hand2",
-            command=lambda t=message.text, b=None: self._copy(t),
+            command=lambda t=message.text: self._copy(t),
         )
 
         def show_copy(_e=None):
@@ -679,15 +1166,21 @@ class PrimeRoboApp:
         def hide_copy(_e=None):
             copy_btn.pack_forget()
 
+        def show_menu(event, msg=message, idx=index):
+            self._show_message_menu(event, msg, idx)
+
         for widget in (wrapper, bubble):
             widget.bind("<Enter>", show_copy)
             widget.bind("<Leave>", hide_copy)
+            widget.bind("<Button-3>", show_menu)
+            widget.bind("<Button-2>", show_menu)
 
     def _make_bubble_canvas(self, parent, text, bg_color, fg_color) -> tk.Canvas:
+        p = self.palette
         wrap = self._wrap_width()
-        font = Theme.font(Theme.SIZE_BODY)
+        f = font(SIZE_BODY)
 
-        probe = tk.Label(parent, text=text, font=font, wraplength=wrap, justify=tk.LEFT)
+        probe = tk.Label(parent, text=text, font=f, wraplength=wrap, justify=tk.LEFT)
         probe.update_idletasks()
         text_w = probe.winfo_reqwidth()
         text_h = probe.winfo_reqheight()
@@ -696,13 +1189,26 @@ class PrimeRoboApp:
         width = text_w + 2 * self.BUBBLE_PAD_X
         height = text_h + 2 * self.BUBBLE_PAD_Y
 
-        canvas = tk.Canvas(parent, width=width, height=height, bg=self.bg, bd=0, highlightthickness=0)
-        rounded_rect(canvas, 0, 0, width, height, radius=16, fill=bg_color, outline=bg_color)
+        canvas = tk.Canvas(parent, width=width, height=height, bg=p.bg, bd=0, highlightthickness=0)
+        rounded_rect(canvas, 0, 0, width - 1, height - 1, radius=16,
+                     fill=bg_color, outline=p.border, width=1)
         canvas.create_text(
-            self.BUBBLE_PAD_X, self.BUBBLE_PAD_Y, text=text, fill=fg_color, font=font,
+            self.BUBBLE_PAD_X, self.BUBBLE_PAD_Y, text=text, fill=fg_color, font=f,
             anchor="nw", width=wrap, justify=tk.LEFT,
         )
         return canvas
+
+    def _show_message_menu(self, event, message: Message, index: int) -> None:
+        p = self.palette
+        menu = tk.Menu(self.root, tearoff=0, bd=0, bg=p.sidebar_item, fg=p.text_primary,
+                        activebackground=p.accent, activeforeground=p.text_on_accent)
+        menu.add_command(label="📋 Copy", command=lambda: self._copy(message.text))
+        menu.add_command(label="🗑 Delete message", command=lambda: self._delete_message(index))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _delete_message(self, index: int) -> None:
+        self.chat_store.delete_message(self.current_chat, index)
+        self._render_chat()
 
     def _copy(self, text: str) -> None:
         self.root.clipboard_clear()
@@ -710,43 +1216,74 @@ class PrimeRoboApp:
         self._flash_status("Copied to clipboard ✓")
 
     def _flash_status(self, text: str, ms: int = 1800) -> None:
+        self._flash_active = True
         self.status_label.configure(text=text)
-        self.root.after(ms, lambda: self.status_label.configure(text=""))
+        self.root.after(ms, self._end_flash)
+
+    def _end_flash(self) -> None:
+        self._flash_active = False
+        self._update_status_count()
+
+    def _update_status_count(self) -> None:
+        if self._flash_active:
+            return
+        count = len(self.chat_store.chats[self.current_chat])
+        self.status_label.configure(text=f"{count} message{'s' if count != 1 else ''}")
 
     # ------------------------------ messaging ------------------------------ #
 
     def _append(self, sender: str, text: str, is_user: bool) -> None:
         self.chat_store.append(self.current_chat, Message(sender, text, is_user))
+        if is_user:
+            self._near_bottom = True
         self._render_chat()
 
-    def _append_bot(self, text: str) -> None:
+    def reply(self, text: str) -> None:
+        """Public entry point Skills use to send a PrimeRobo response."""
         self._append("PrimeRobo", text, is_user=False)
 
     def _cancel_teaching(self, _event=None) -> None:
         if self.teaching_mode:
             self.teaching_mode = False
             self.pending_question = ""
-            self._append_bot("Learning phase cancelled.")
+            self.reply("Learning phase cancelled.")
+
+    # ------------------------------ input widget ---------------------------- #
+
+    def _get_input_text(self) -> str:
+        return self.entry.get("1.0", "end-1c").strip()
+
+    def _clear_input(self) -> None:
+        self.entry.delete("1.0", "end")
+        self.entry.configure(height=1)
+
+    def _on_return(self, event):
+        if event.state & 0x0001:  # Shift held -> allow a newline
+            return None
+        self.handle_send()
+        return "break"
+
+    def _autogrow_input(self, _event=None) -> None:
+        try:
+            counts = self.entry.count("1.0", "end", "displaylines")
+            lines = counts[0] if counts else 1
+        except tk.TclError:
+            lines = 1
+        new_height = max(1, min(lines, self.MAX_INPUT_LINES))
+        if int(self.entry.cget("height")) != new_height:
+            self.entry.configure(height=new_height)
 
     # ------------------------------ routing ------------------------------ #
 
-    _TIME_QUERIES = {"what is the time", "what is time", "time", "current time"}
-    _DATE_QUERIES = {
-        "what is the date", "what is date", "date", "today's date",
-        "what is today", "today", "day",
-    }
-    _DEFINE_RE = re.compile(r"^(?:define|meaning of|what is the meaning of)\s+([a-zA-Z0-9\s\-_]+)$")
-    _WIKI_RE = re.compile(r"^(?:who is|who was|tell me about|search up)\s+([a-zA-Z0-9\s\-_]+)$")
-
-    def handle_send(self, _event=None) -> None:
-        text = self.entry.get().strip()
+    def handle_send(self) -> None:
+        text = self._get_input_text()
         if not text:
             return
-        self.entry.delete(0, tk.END)
+        self._clear_input()
         self._append("You", text, is_user=True)
 
-        if text.lower() == "quit":
-            self.root.quit()
+        if text.lower().strip() == "quit":
+            self._on_close()
             return
 
         if self.teaching_mode:
@@ -754,78 +1291,90 @@ class PrimeRoboApp:
             return
 
         lowered = text.lower().strip()
+        for skill in self.skills:
+            if skill.try_handle(self, text, lowered):
+                return
 
-        if lowered in self._TIME_QUERIES:
-            self._append_bot(f"Current time: {datetime.now().strftime('%I:%M %p')}")
-            return
-
-        if lowered in self._DATE_QUERIES:
-            self._append_bot(f"Today is {datetime.now().strftime('%A, %B %d, %Y')}")
-            return
-
-        define_match = self._DEFINE_RE.match(lowered)
-        if define_match:
-            self._lookup_definition(define_match.group(1).strip())
-            return
-
-        wiki_match = self._WIKI_RE.match(lowered)
-        if wiki_match:
-            self._lookup_wikipedia(wiki_match.group(1).strip())
-            return
-
-        try:
-            result = parse_and_calculate(text)
-        except ValueError as exc:
-            self._append_bot(f"⚠️ {exc}")
-            return
-        if result is not None:
-            self._append_bot(f"Result: {result:g}")
-            return
-
-        answer = self.knowledge_base.find_answer(text)
-        if answer:
-            self._append_bot(answer)
-            return
-
-        self._append_bot(
-            "I don't know that one yet. Reply with the answer to teach me, "
-            "or type 'skip' to move on."
-        )
-        self.teaching_mode = True
-        self.pending_question = text
+        # KnowledgeBaseSkill always returns True, so this is unreachable —
+        # kept only as a defensive fallback.
+        self.reply("Sorry, something went wrong processing that.")
 
     def _handle_teaching_reply(self, text: str) -> None:
         if text.lower() != "skip":
             self.knowledge_base.teach(self.pending_question, text)
-            self._append_bot("Got it — I'll remember that.")
+            self.reply("Got it — I'll remember that.")
         else:
-            self._append_bot("Okay, skipped.")
+            self.reply("Okay, skipped.")
         self.teaching_mode = False
         self.pending_question = ""
 
-    def _lookup_definition(self, word: str) -> None:
-        self.send_button.configure(state="disabled", text="…")
-        self._append_bot(f"Looking up '{word}'…")
+    # --------------------------- network lookups --------------------------- #
+
+    def lookup_definition(self, word: str) -> None:
+        self._begin_network_call(f"Looking up '{word}'")
 
         def done(result: Optional[str]):
-            self.send_button.configure(state="normal", text="TRANSMIT")
             final = result or f"No definition found online for '{word}'."
-            self.chat_store.replace_last(self.current_chat, Message("PrimeRobo", final, False))
-            self._render_chat()
+            self._finish_network_call(final)
 
         self.network.run(lambda: NetworkService.fetch_definition(word), done)
 
-    def _lookup_wikipedia(self, subject: str) -> None:
-        self.send_button.configure(state="disabled", text="…")
-        self._append_bot(f"Searching for '{subject}'…")
+    def lookup_wikipedia(self, subject: str) -> None:
+        self._begin_network_call(f"Searching for '{subject}'")
 
         def done(result: Optional[str]):
-            self.send_button.configure(state="normal", text="TRANSMIT")
             final = result or f"No page found for '{subject}'."
-            self.chat_store.replace_last(self.current_chat, Message("PrimeRobo", final, False))
-            self._render_chat()
+            self._finish_network_call(final)
 
         self.network.run(lambda: NetworkService.fetch_wikipedia_summary(subject), done)
+
+    def _begin_network_call(self, base_text: str) -> None:
+        self.send_button.configure(state="disabled")
+        self._append("PrimeRobo", base_text, is_user=False)
+        self._thinking_base_text = base_text
+        self._thinking_chat = self.current_chat
+        self._thinking_frame = 0
+        self._tick_thinking()
+
+    def _tick_thinking(self) -> None:
+        dots = "." * (self._thinking_frame % 3 + 1)
+        self._set_pending_text(self._thinking_chat, f"{self._thinking_base_text}{dots}")
+        self._thinking_frame += 1
+        self._thinking_job = self.root.after(450, self._tick_thinking)
+
+    def _set_pending_text(self, chat_name: str, text: str) -> None:
+        messages = self.chat_store.chats.get(chat_name)
+        if not messages:
+            return
+        last = messages[-1]
+        messages[-1] = Message(last.sender, text, last.is_user, last.timestamp)
+        if chat_name == self.current_chat:
+            self._render_chat()
+
+    def _finish_network_call(self, final_text: str) -> None:
+        if self._thinking_job is not None:
+            self.root.after_cancel(self._thinking_job)
+            self._thinking_job = None
+        self.send_button.configure(state="normal")
+
+        chat_name = self._thinking_chat
+        messages = self.chat_store.chats.get(chat_name)
+        if messages:
+            last = messages[-1]
+            messages[-1] = Message("PrimeRobo", final_text, False, last.timestamp)
+            self.chat_store.save()
+        if chat_name == self.current_chat:
+            self._render_chat()
+
+    # ------------------------------ lifecycle ------------------------------ #
+
+    def _on_close(self, *_args) -> None:
+        try:
+            self.settings.geometry = self.root.geometry()
+            self.settings.save()
+        except tk.TclError:
+            pass
+        self.root.destroy()
 
 
 def main() -> None:
