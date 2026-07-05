@@ -423,14 +423,17 @@ class ChatStore:
         self.chats[name].append(message)
         self.save()
 
-    def delete_message(self, name: str, index: int) -> None:
+    def delete_message(self, name: str, index: int) -> bool:
+        """Delete one message. Returns False (and does nothing) if the
+        index is invalid or it's the last remaining message in the chat —
+        a chat is never left completely empty.
+        """
         messages = self.chats.get(name)
-        if not messages or not (0 <= index < len(messages)):
-            return
+        if not messages or not (0 <= index < len(messages)) or len(messages) <= 1:
+            return False
         del messages[index]
-        if not messages:
-            messages.append(Message("PrimeRobo", "…", False))
         self.save()
+        return True
 
 
 # --------------------------------------------------------------------------- #
@@ -714,6 +717,7 @@ class PrimeRoboApp:
         self._build_main_panel()
 
         self.context_menu = tk.Menu(self.root, tearoff=0, bd=0)
+        self.message_menu = tk.Menu(self.root, tearoff=0, bd=0)
         self.root.bind("<Control-n>", lambda e: self.create_chat())
 
     def _build_sidebar(self) -> None:
@@ -777,9 +781,14 @@ class PrimeRoboApp:
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.scrollbar.grid(row=0, column=1, sticky="ns")
 
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        self.canvas.bind_all("<Button-4>", lambda e: self._scroll_units(-2))
-        self.canvas.bind_all("<Button-5>", lambda e: self._scroll_units(2))
+        # Bind wheel-scrolling to the canvas and its (empty) background
+        # frame once here; each bubble row binds itself too when created,
+        # so scrolling works anywhere over the chat log without walking
+        # the whole widget tree on every render.
+        for w in (self.canvas, self.scroll_frame):
+            w.bind("<MouseWheel>", self._on_mousewheel)
+            w.bind("<Button-4>", lambda e: self._scroll_units(-2))
+            w.bind("<Button-5>", lambda e: self._scroll_units(2))
 
         self.jump_pill = tk.Button(
             self.body, text="↓  Jump to latest", font=font(SIZE_SMALL, "bold"),
@@ -857,6 +866,8 @@ class PrimeRoboApp:
         self.send_button.configure(bg=p.accent, fg=p.text_on_accent, activebackground=p.accent_hover)
 
         self.context_menu.configure(bg=p.sidebar_item, fg=p.text_primary,
+                                     activebackground=p.accent, activeforeground=p.text_on_accent)
+        self.message_menu.configure(bg=p.sidebar_item, fg=p.text_primary,
                                      activebackground=p.accent, activeforeground=p.text_on_accent)
 
         self._refresh_sidebar()
@@ -1097,29 +1108,40 @@ class PrimeRoboApp:
         return max(self.MIN_WRAP, int(available * 0.62))
 
     def _render_chat(self) -> None:
-        for widget in self.scroll_frame.winfo_children():
-            widget.destroy()
-        self.title_label.configure(text=self.current_chat)
+        """Renders the chat interface efficiently without causing layout lag or breaking headers."""
+        messages = self.chat_store.chats.get(self.current_chat, [])
+        existing_widgets = self.scroll_frame.winfo_children()
+        num_existing = len(existing_widgets)
 
-        messages = self.chat_store.chats[self.current_chat]
-        previous: Optional[Message] = None
-        for index, message in enumerate(messages):
-            grouped = (
-                previous is not None
-                and previous.sender == message.sender
-                and previous.is_user == message.is_user
-            )
-            self._render_bubble(message, index, show_header=not grouped)
-            previous = message
+        # Helper logic to determine if a header should be shown (same as your original code)
+        def should_show_header(idx: int) -> bool:
+            if idx == 0:
+                return True
+            return messages[idx].sender != messages[idx - 1].sender
 
-        self.root.update_idletasks()
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        if self._near_bottom:
-            self.canvas.yview_moveto(1.0)
-            self._hide_jump_pill()
+        # Case A: If the screen was cleared, switched, or emptied, perform a fresh draw
+        if num_existing == 0 or num_existing > len(messages):
+            for w in existing_widgets:
+                w.destroy()
+            for idx, msg in enumerate(messages):
+                show_header = should_show_header(idx)
+                self._render_bubble(msg, idx, show_header)
+        
+        # Case B: Smart incremental update (Only draw the absolute newest messages)
         else:
-            self._show_jump_pill()
-        self._update_status_count()
+            for idx in range(num_existing, len(messages)):
+                show_header = should_show_header(idx)
+                self._render_bubble(messages[idx], idx, show_header)
+
+        # Gently update scroll window placement metrics smoothly
+        self.root.update_idletasks()
+        
+        # Only bind the wheel to newly appended items if required by your script setup
+        if hasattr(self, '_bind_wheel'):
+            self._bind_wheel(self.scroll_frame)
+            
+        # Smoothly snap down to the newest message block
+        self.canvas.yview_moveto(1.0)
 
     def _render_bubble(self, message: Message, index: int, show_header: bool) -> None:
         p = self.palette
@@ -1190,7 +1212,8 @@ class PrimeRoboApp:
         height = text_h + 2 * self.BUBBLE_PAD_Y
 
         canvas = tk.Canvas(parent, width=width, height=height, bg=p.bg, bd=0, highlightthickness=0)
-        rounded_rect(canvas, 0, 0, width - 1, height - 1, radius=16,
+        radius = max(4, min(16, (width - 1) / 2, (height - 1) / 2))
+        rounded_rect(canvas, 0, 0, width - 1, height - 1, radius=radius,
                      fill=bg_color, outline=p.border, width=1)
         canvas.create_text(
             self.BUBBLE_PAD_X, self.BUBBLE_PAD_Y, text=text, fill=fg_color, font=f,
@@ -1199,15 +1222,16 @@ class PrimeRoboApp:
         return canvas
 
     def _show_message_menu(self, event, message: Message, index: int) -> None:
-        p = self.palette
-        menu = tk.Menu(self.root, tearoff=0, bd=0, bg=p.sidebar_item, fg=p.text_primary,
-                        activebackground=p.accent, activeforeground=p.text_on_accent)
+        menu = self.message_menu
+        menu.delete(0, tk.END)
         menu.add_command(label="📋 Copy", command=lambda: self._copy(message.text))
         menu.add_command(label="🗑 Delete message", command=lambda: self._delete_message(index))
         menu.tk_popup(event.x_root, event.y_root)
 
     def _delete_message(self, index: int) -> None:
-        self.chat_store.delete_message(self.current_chat, index)
+        if not self.chat_store.delete_message(self.current_chat, index):
+            self._flash_status("Can't delete the last message in a chat.")
+            return
         self._render_chat()
 
     def _copy(self, text: str) -> None:
@@ -1375,6 +1399,26 @@ class PrimeRoboApp:
         except tk.TclError:
             pass
         self.root.destroy()
+
+    def _bind_wheel(self, widget: tk.Widget) -> None:
+        """Recursively binds the mouse wheel event to a widget and all its children."""
+        widget.bind("<MouseWheel>", self._on_wheel)
+        widget.bind("<Button-4>", self._on_wheel)  # Linux scroll up
+        widget.bind("<Button-5>", self._on_wheel)  # Linux scroll down
+        
+        for child in widget.winfo_children():
+            self._bind_wheel(child)
+
+    def _on_wheel(self, event: tk.Event) -> None:
+        """Handles mouse wheel scrolling safely across Windows, macOS, and Linux platforms."""
+        # Windows / macOS
+        if event.delta != 0:
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        # Linux Support
+        elif event.num == 4:
+            self.canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.canvas.yview_scroll(1, "units")
 
 
 def main() -> None:
